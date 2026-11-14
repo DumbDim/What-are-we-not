@@ -48,6 +48,7 @@ RISK_TIGHT, RISK_LOOSE, RISK_MIN_ORDERS = 9.0, 0.02, 20  # adaptive guard off (i
 TIGHT_CAP, TIGHT_STUCK, TIGHT_LEAD = 0.5, 2, 60  # when tight: cap share x0.5, stop at 2 stuck, +60 min lead
 # Multi-car gigs (level 3+): chain two single-car orders when one's delivery ends near the other's pickup.
 COMBO_LEVEL, COMBO_GAP, COMBO_FACTOR, COMBO_MAX_DRIVE = 99, 45, 0.90, 11 * HOUR
+HOT_CAP_PLACES, HOT_CAP_SHARE = ["vantaa", "hyvinkaa"], 0.09  # level 8: a larger per-town share for our busiest pickups (0 = off)
 STUCK_STOP = 3  # stop taking orders near a pickup while this many of ours there are past their warning without a driver
 DECLINE = 5  # from level 4, decline with a quote this many times the list price: a lost quote costs nothing
 
@@ -225,6 +226,8 @@ class SmartDesk:
         drivers = sum(len(self.driver_mgr.home_places.get(p, [])) for p in nearby)
         # The shortage is uneven: towns that kept their drivers take more, near-empty ones less.
         share = CAP_SHARE_RICH if drivers >= CAP_RICH else CAP_SHARE
+        if self.level >= 8 and place in HOT_CAP_PLACES:
+            share = max(share, HOT_CAP_SHARE)
         if self.guard():
             share *= TIGHT_CAP
         cap = max(1 if drivers < CAP_POOR else CAP_MIN, int(drivers * share))

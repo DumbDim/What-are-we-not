@@ -7,6 +7,9 @@ from spread.types import PriceRequest, DeliveryOption
 
 HOUR = 60
 DAY1_DISCOUNT, DISCOUNT_UNTIL = 1.0, 1440  # level 8: multiply quotes by this before DISCOUNT_UNTIL (Tuesday 00:00) to build trust early
+FLOOR_QUOTE = True  # levels 7-8: quote the least profitable price instead of declining a thin-margin request
+HOT_PICKUPS, HOT_PRICE = ["vantaa", "hyvinkaa"], 0.93  # level 8: price factor for pickups in our busiest towns
+LOW_DESTS, LOW_DEST_MARKUP = ["kajaani", "kemi", "kotka", "savonlinna"], 1.25  # level 8: extra markup to places that earn little
 WAR_PRICE = 0.82  # level 8: on a detected price-war day, multiply quotes by this (1.0 = sit it out)
 MONDAY_MARKUP = None  # level 8: starting markup on Monday instead of L8_MARKUP (None = same)
 L7_MARKUP, L8_MARKUP = 1.30, 1.40  # starting price over the list price; learned lane prices adjust it
@@ -78,10 +81,11 @@ class Pricer:
             trust_bonus = min(trust_count, 25) * 0.01
             base = int(base * (1 + trust_bonus))
 
+        floor = int(ref_fee * EXPECTED_FEE * (1 + MIN_MARGIN))
         if self.level >= 7:
             # Judge the margin on the price we quote against the fee we expect to pay
             # (drivers mostly book between 1.0 and 1.6 times the typical fee).
-            if base < ref_fee * EXPECTED_FEE * (1 + MIN_MARGIN):
+            if base < floor and not FLOOR_QUOTE:
                 return None
         elif driver_supply < 0.5:
             if ref_fee > list_price * 0.7:
@@ -90,6 +94,11 @@ class Pricer:
 
         if self.level >= 4:
             base = int(base * self.lane_factor(request))
+        if self.level >= 8:
+            if request["legs"][0]["pickup"]["placeId"] in HOT_PICKUPS:
+                base = int(base * HOT_PRICE)
+            if request["legs"][0]["delivery"]["placeId"] in LOW_DESTS:
+                base = int(base * LOW_DEST_MARKUP)
 
         if option["kind"] == "same_day":
             base = int(base * 0.98)
@@ -103,6 +112,8 @@ class Pricer:
             base = int(base * DAY1_DISCOUNT)
 
         min_price = int(ref_fee * 1.15)
+        if self.level >= 7 and FLOOR_QUOTE:
+            min_price = max(min_price, floor)  # never below the least profitable price
         return max(base, min_price)
 
     # ── Learned prices ──
