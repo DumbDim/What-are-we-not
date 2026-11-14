@@ -26,3 +26,4 @@ tools/runs/
 __pycache__/
 tools/*.txt
 tools/_edit_desk.py
+tools/_edit_combo.py

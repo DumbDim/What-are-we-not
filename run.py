@@ -58,6 +58,7 @@ def play_practice(world: World, level: int, router: Router) -> None:
 
         if desk.now // DAY > day:
             report(WEEKDAYS[day % 7], world.score())
+    return desk
 
 
 def play_final(world: World, router: Router) -> None:

@@ -150,12 +150,18 @@ def play_one(level, seed, verbose, keep, attempts=4):
         world = client.create(level=level, seed=seed)
         buf = io.StringIO()
         try:
-            run.play_practice(world, level, router)
+            desk = run.play_practice(world, level, router)
+            print(f"[{seed}] multi-car gigs posted: {desk.combo_count}", flush=True)
+            tw = desk.pricer.dealer_wins
+            print(f"[{seed}] trust: dealers {len(tw)}, total count {sum(tw.values())}, at 25: {sum(1 for v in tw.values() if v >= 25)}, avg {sum(tw.values()) / max(1, len(tw)):.1f}", flush=True)
+            print(f"[{seed}] requests: " + ", ".join(f"{k}={v}" for k, v in desk.reasons.most_common()), flush=True)
+            D = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+            print(f"[{seed}] guard: " + ", ".join(f"{D[(t // 1440) % 7]} {t % 1440 // 60:02d}:{t % 60:02d} {s} ({r:.1%})" for t, s, r in desk.guard_log), flush=True)
             score = world.score()
             events = world.events()
             try:
                 os.makedirs(os.path.join(ROOT, "tools", "runs"), exist_ok=True)
-                with open(os.path.join(ROOT, "tools", "runs", f"reveal_L{level}_{seed}.json"), "w") as fh:
+                with open(os.path.join(ROOT, "tools", "runs", f"reveal_L{level}_{seed}{os.environ.get('TAG', '')}.json"), "w") as fh:
                     json.dump(world.reveal(), fh)
             except Exception as e:
                 print("reveal failed", e, file=sys.stderr)
@@ -168,7 +174,7 @@ def play_one(level, seed, verbose, keep, attempts=4):
             if not keep:
                 _delete(world)
     os.makedirs(os.path.join(ROOT, "tools", "runs"), exist_ok=True)
-    with open(os.path.join(ROOT, "tools", "runs", f"L{level}_{seed}.json"), "w") as fh:
+    with open(os.path.join(ROOT, "tools", "runs", f"L{level}_{seed}{os.environ.get('TAG', '')}.json"), "w") as fh:
         json.dump(events, fh)
     out = io.StringIO()
     with LOCK, contextlib.redirect_stdout(out):

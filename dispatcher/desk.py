@@ -1,5 +1,9 @@
 """Main dispatcher: the brain that ties routing, pricing, and driver management together."""
 from __future__ import annotations
+import collections
+import json
+import os
+import sys
 from typing import Optional
 from spread.client import World
 from spread.types import (
@@ -12,7 +16,7 @@ from spread.starter import (
 from .routing import Router
 from .pricing import Pricer
 from .drivers import DriverManager
-from .timing import estimate_last_pickup, awake_minutes, open_interval, latest_open_at_or_before
+from .timing import estimate_last_pickup, awake_minutes, open_interval, latest_open_at_or_before, earliest_open_at_or_after
 from .notes import read_note, noted_legs, NoteFacts
 
 HOUR = 60
@@ -36,6 +40,14 @@ CAP_RICH, CAP_SHARE_RICH, CAP_POOR = 100, 0.06, 10  # places with this many driv
 FEE_HOLD_SHARE = 0.5  # hold the opening fee for this share of the waking time before the deadline warning
 OFFER_NEAR_MIN, OFFER_RECENT = 60, 4 * HOUR  # offer a gig to our drivers who finished this close and this recently
 REMOTE_SHARE = 0.015  # a delivery place with fewer than this share of all drivers nearby is remote
+L8_BUFFER, L7_BUFFER = 6 * HOUR, 4 * HOUR  # levels 7-8: pickup + this + drive must fit before the deadline
+MIN_DRIVERS = {7: 3, 8: 4}  # levels 7-8: least drivers living within 45 minutes of the pickup
+# Adaptive guard: when our own lateness (late orders + orders past their warning without a driver)
+# passes RISK_TIGHT of the orders won so far, tighten; loosen again under RISK_LOOSE.
+RISK_TIGHT, RISK_LOOSE, RISK_MIN_ORDERS = 9.0, 0.02, 20  # adaptive guard off (it switched on too late to help)
+TIGHT_CAP, TIGHT_STUCK, TIGHT_LEAD = 0.5, 2, 60  # when tight: cap share x0.5, stop at 2 stuck, +60 min lead
+# Multi-car gigs (level 3+): chain two single-car orders when one's delivery ends near the other's pickup.
+COMBO_LEVEL, COMBO_GAP, COMBO_FACTOR, COMBO_MAX_DRIVE = 99, 45, 0.90, 11 * HOUR
 STUCK_STOP = 3  # stop taking orders near a pickup while this many of ours there are past their warning without a driver
 DECLINE = 5  # from level 4, decline with a quote this many times the list price: a lost quote costs nothing
 
@@ -70,6 +82,11 @@ class SmartDesk:
         self.pending_pickup: dict[str, str] = {}  # quoted or won order id -> first pickup place, until booked
         self.quoted_last_pickup: dict[str, int] = {}
         self.facts: dict[str, NoteFacts] = {}
+        self.reasons: collections.Counter = collections.Counter()  # why we declined requests
+        self.tight = False  # the adaptive guard is on
+        self.guard_log: list = []
+        self.combo_count = 0
+        self._risk_at = -1
         self.active: dict[str, set[str]] = {}  # driver -> our gigs they hold and have not finished
         self.last_seen: dict[str, tuple[str, int]] = {}  # driver -> (place, minute) of their last delivery for us
         self.open_offers: dict[str, int] = {}  # gig -> offers waiting for an answer
@@ -93,6 +110,11 @@ class SmartDesk:
             self.pending_pickup.pop(event["orderId"], None)
             for books in (self.orders, self.leg_gigs):
                 books.pop(event["orderId"], None)
+            # A withdrawn gig that also carried another order's car: post that car again.
+            for g in event.get("gigs", []):
+                if g["outcome"] == "withdrawn" and self.is_combo(g["gigId"]):
+                    self.dead_gigs.add(g["gigId"])
+                    self.repost_others(g["gigId"], skip=event["orderId"])
         elif kind == "visit_failed":
             self.retry(event["orderId"], event["leg"], event["reason"])
         elif kind == "gig_expired":
@@ -116,8 +138,8 @@ class SmartDesk:
             if driver:
                 self.last_seen[driver] = (event["placeId"], event["at"])
                 action = self.posts.get(event["gigId"])
-                last_leg = action["stops"][-1]["leg"] if action else event["leg"]
-                if event["leg"] == last_leg:
+                last = (action["stops"][-1]["orderId"], action["stops"][-1]["leg"]) if action else (event["orderId"], event["leg"])
+                if (event["orderId"], event["leg"]) == last:
                     self._free(driver, event["gigId"])
         elif kind == "driver_late":
             self.driver_late(event["gigId"], event["pickupAt"])
@@ -155,22 +177,28 @@ class SmartDesk:
         return deadline
 
     def is_feasible(self, request: PriceRequest, option) -> bool:
+        return self.infeasible(request, option) is None
+
+    def infeasible(self, request: PriceRequest, option) -> Optional[str]:
+        """Why we would not take this option, or None when we would."""
         deadline = self.noted_deadline(request, option["deadline"])
         # Enough waking hours for drivers to see and book the gig before its last pickup.
         legs = noted_legs(request["legs"], self.facts_of(request))
         last_pickup = estimate_last_pickup(legs, deadline, self.router)
         if last_pickup < legs[0]["pickup"]["window"]["from"]:
-            return False
+            return "impossible"
         lead_min = LEAD_MIN[self.level]
         longest = max(self.router.drive_minutes(l["pickup"]["placeId"], l["delivery"]["placeId"]) for l in request["legs"])
         if longest >= 4 * HOUR:
             lead_min = max(lead_min, 6 * HOUR)  # long drives with little notice were late ~40% of the time
+        if self.guard():
+            lead_min += TIGHT_LEAD
         if awake_minutes(request["respondBy"], last_pickup) < lead_min:
-            return False
+            return "lead_time"
         if not self.has_capacity(request["legs"][0]["pickup"]["placeId"]):
-            return False
+            return "capacity"
         if self.level < 7:
-            return True
+            return None
         for leg in request["legs"]:
             pickup_place = leg["pickup"]["placeId"]
             delivery_place = leg["delivery"]["placeId"]
@@ -178,16 +206,15 @@ class SmartDesk:
 
             drive_time = self.router.drive_minutes(pickup_place, delivery_place)
             # 6h buffer at L8: drivers are scarce and slow to book
-            buffer = 6 * HOUR if self.level >= 8 else (4 * HOUR if self.level >= 7 else HOUR)
+            buffer = L8_BUFFER if self.level >= 8 else L7_BUFFER
             earliest_delivery = max(self.now, pickup_from) + buffer + drive_time
             if earliest_delivery > deadline:
-                return False
+                return "buffer"
 
             nearby = self.driver_mgr.drivers_near(pickup_place, self.router, max_minutes=45)
-            min_drivers = 4 if self.level >= 8 else (3 if self.level >= 7 else 1)
-            if len(nearby) < min_drivers:
-                return False
-        return True
+            if len(nearby) < MIN_DRIVERS.get(self.level, 1):
+                return "few_drivers"
+        return None
 
     def has_capacity(self, place: str) -> bool:
         """Few enough of our orders near this pickup still wait for a driver."""
@@ -198,6 +225,8 @@ class SmartDesk:
         drivers = sum(len(self.driver_mgr.home_places.get(p, [])) for p in nearby)
         # The shortage is uneven: towns that kept their drivers take more, near-empty ones less.
         share = CAP_SHARE_RICH if drivers >= CAP_RICH else CAP_SHARE
+        if self.guard():
+            share *= TIGHT_CAP
         cap = max(1 if drivers < CAP_POOR else CAP_MIN, int(drivers * share))
         waiting = stuck = 0
         for oid, pickup in list(self.pending_pickup.items()):
@@ -209,9 +238,38 @@ class SmartDesk:
                 if oid in self.urgent:
                     stuck += 1
         # Drivers there stopped booking (a flu day, a busy day): take nothing more until they catch up.
-        if stuck >= STUCK_STOP:
+        if stuck >= (TIGHT_STUCK if self.guard() else STUCK_STOP):
             return False
         return waiting < cap
+
+    def risk(self) -> float:
+        """Our lateness so far: orders already late, or past their warning with no driver,
+        over the orders we have won."""
+        if len(self.orders) < RISK_MIN_ORDERS:
+            return 0.0
+        bad = 0
+        for oid, o in self.orders.items():
+            done = o["deliveredAt"]
+            if all(d is not None for d in done):
+                bad += max(done) > o["deadline"]
+            elif self.now > o["deadline"]:
+                bad += 1
+            elif oid in self.urgent and not any(g in self.booked for g in self.gigs_of(oid)):
+                bad += 1
+        return bad / len(self.orders)
+
+    def guard(self) -> bool:
+        """Is the adaptive guard on? Re-evaluated at most once a minute of world time."""
+        if self._risk_at != self.now:
+            self._risk_at = self.now
+            r = self.risk()
+            if not self.tight and r > RISK_TIGHT:
+                self.tight = True
+                self.guard_log.append((self.now, "on", round(r, 3)))
+            elif self.tight and r < RISK_LOOSE:
+                self.tight = False
+                self.guard_log.append((self.now, "off", round(r, 3)))
+        return self.tight
 
     def order_last_pickup(self, oid: str) -> int:
         order = self.orders.get(oid)
@@ -242,8 +300,10 @@ class SmartDesk:
             self.note_quote(request, first["deadline"])
             return
 
-        feasible_kinds = {o["kind"] for o in request["options"] if self.is_feasible(request, o)}
+        why = {o["kind"]: self.infeasible(request, o) for o in request["options"]}
+        feasible_kinds = {k for k, r in why.items() if r is None}
         if not feasible_kinds:
+            self.reasons[why[request["options"][-1]["kind"]]] += 1
             self.decline(request)
             return
 
@@ -255,9 +315,11 @@ class SmartDesk:
             prices = {k: int(v * 1.10) for k, v in prices.items()}
 
         if not prices:
+            self.reasons["price_margin"] += 1
             self.decline(request)
             return
 
+        self.reasons["quoted"] += 1
         self.outbox.append({"type": "quote", "requestId": request["id"], "prices": prices})
         self.pricer.record_quote(request)
         self.note_quote(request, max(o["deadline"] for o in request["options"] if o["kind"] in prices))
@@ -284,6 +346,8 @@ class SmartDesk:
             self.orders[order["id"]] = order
             self.pricer.record_win(order["dealerId"], order["priceCents"], order["option"])
             self.pricer.record_result(order["id"], True, self.now)
+            if self.level >= COMBO_LEVEL and self.try_combo(order):
+                return
             self.post(order, undelivered(order))
 
     def change(self, order: Order) -> None:
@@ -395,6 +459,9 @@ class SmartDesk:
             self.leg_gigs.get(s["orderId"], {}).get(s["leg"]) == gig_id for s in action["stops"]
         ):
             return
+        if self.is_combo(gig_id):
+            self.repost_others(gig_id)
+            return
         for stop in action["stops"]:
             self.leg_gigs.get(stop["orderId"], {}).pop(stop["leg"], None)
         order = self.orders.get(action["stops"][0]["orderId"])
@@ -412,6 +479,13 @@ class SmartDesk:
         self.urgent.add(order_id)
         self.urgent_at[order_id] = self.now
         self.send_post_of(order_id)
+        for gig_id in self.gigs_of(order_id):
+            if self.is_combo(gig_id) and gig_id not in self.booked:
+                # The pair found no driver in time: split it, each car at its own fees.
+                self.outbox.append({"type": "withdraw", "gigId": gig_id})
+                self.dead_gigs.add(gig_id)
+                self.repost_others(gig_id)
+                return
         for gig_id in self.gigs_of(order_id):
             if gig_id not in self.booked:
                 schedule = self.schedule_for(order, pickups(self.posts[gig_id]))
@@ -437,7 +511,7 @@ class SmartDesk:
         if order is None:
             return
         for gig_id in self.gigs_of(order_id):
-            if gig_id in self.booked:
+            if gig_id in self.booked or self.is_combo(gig_id):
                 continue
             action = self.posts.get(gig_id)
             if action is None:
@@ -469,7 +543,7 @@ class SmartDesk:
     def _try_next_offer(self, gig_id: str) -> None:
         """After an offer is declined/expired, try the next best driver."""
         action = self.posts.get(gig_id)
-        if action is None or gig_id in self.booked:
+        if action is None or gig_id in self.booked or self.is_combo(gig_id):
             return
         order_id = action["stops"][0]["orderId"]
         order = self.orders.get(order_id)
@@ -573,7 +647,7 @@ class SmartDesk:
         """A booked driver will collect the first car late. Keep them when the car still arrives on time,
         or when no other driver could do better; else release them, free, and post the gig again."""
         action = self.posts.get(gig_id)
-        if action is None:
+        if action is None or self.is_combo(gig_id):
             return
         order = self.orders.get(action["stops"][0]["orderId"])
         if order is None:
@@ -591,6 +665,118 @@ class SmartDesk:
         for leg in legs:
             self.leg_gigs.get(order["id"], {}).pop(leg, None)
         self.post(order, legs)
+
+    # ── Multi-car gigs ──
+
+    def is_combo(self, gig_id: str) -> bool:
+        action = self.posts.get(gig_id)
+        return action is not None and len({s["orderId"] for s in action["stops"]}) > 1
+
+    def repost_others(self, gig_id: str, skip: Optional[str] = None) -> None:
+        """Post each order of a combo gig again on its own (all but `skip`)."""
+        action = self.posts.get(gig_id)
+        if action is None:
+            return
+        by_order: dict[str, list[int]] = {}
+        for st in action["stops"]:
+            if st["kind"] == "pickup":
+                by_order.setdefault(st["orderId"], []).append(st["leg"])
+        for oid, legs in by_order.items():
+            if oid == skip:
+                continue
+            order = self.orders.get(oid)
+            if order is None:
+                continue
+            legs = [l for l in legs if self.leg_gigs.get(oid, {}).get(l) == gig_id]
+            for l in legs:
+                self.leg_gigs[oid].pop(l, None)
+            if legs:
+                self.post(order, legs)
+
+    def combo_candidate(self, order: Order) -> bool:
+        """A single car between dealer sites, with time to spare."""
+        if order["id"] in self.urgent or len(order["legs"]) != 1 or undelivered(order) != [0]:
+            return False
+        leg = order["legs"][0]
+        if leg["pickup"]["privateAddress"] or leg["delivery"]["privateAddress"]:
+            return False
+        return self.eff_last_pickup(order) - 3 * HOUR - self.now >= HOUR
+
+    def chain_fits(self, x: Order, y: Order) -> bool:
+        """Can one driver deliver x, then collect y nearby, keeping both orders on time with margin?"""
+        lx = noted_legs(x["legs"], self.facts_of(self.requests[x["id"]]))[0]
+        ly = noted_legs(y["legs"], self.facts_of(self.requests[y["id"]]))[0]
+        gap = self.router.drive_minutes(lx["delivery"]["placeId"], ly["pickup"]["placeId"])
+        if gap > COMBO_GAP:
+            return False
+        dx = self.router.drive_minutes(lx["pickup"]["placeId"], lx["delivery"]["placeId"])
+        dy = self.router.drive_minutes(ly["pickup"]["placeId"], ly["delivery"]["placeId"])
+        if dx + gap + dy > COMBO_MAX_DRIVE:
+            return False
+        bx = SAFETY_MIN + int(dx * SAFETY_SHARE)
+        by = SAFETY_MIN + int(dy * SAFETY_SHARE)
+        t = earliest_open_at_or_after(lx["pickup"]["hours"], max(self.now + HOUR, lx["pickup"]["window"]["from"]))
+        if t > x["lastPickupAt"] - bx:
+            return False
+        arrive_x = t + dx
+        if arrive_x > x["deadline"] - bx:
+            return False
+        ty = earliest_open_at_or_after(ly["pickup"]["hours"], max(arrive_x + gap, ly["pickup"]["window"]["from"]))
+        if ty > y["lastPickupAt"] - by or ty + dy > y["deadline"] - by:
+            return False
+        return True
+
+    def try_combo(self, order: Order) -> bool:
+        """Chain a newly won order with one of our open single-car gigs. True when posted as a pair."""
+        if not self.combo_candidate(order):
+            return False
+        best = None
+        for oid, other in self.orders.items():
+            if oid == order["id"] or not self.combo_candidate(other):
+                continue
+            gigs = self.gigs_of(oid)
+            if len(gigs) != 1:
+                continue
+            gig = gigs[0]
+            if gig in self.booked or gig in self.dead_gigs or self.is_combo(gig) or self.open_offers.get(gig, 0):
+                continue
+            a, b = other["legs"][0], order["legs"][0]
+            for x, y, lx, ly in ((other, order, a, b), (order, other, b, a)):
+                gap = self.router.drive_minutes(lx["delivery"]["placeId"], ly["pickup"]["placeId"])
+                if gap <= COMBO_GAP and (best is None or gap < best[0]) and self.chain_fits(x, y):
+                    best = (gap, x, y, gig, oid)
+        if best is None:
+            return False
+        _, x, y, gig, oid = best
+        self.outbox.append({"type": "withdraw", "gigId": gig})
+        self.dead_gigs.add(gig)
+        self.leg_gigs.pop(oid, None)
+        self.post_combo(x, y)
+        self.combo_count += 1
+        return True
+
+    def post_combo(self, x: Order, y: Order) -> None:
+        stops: list[StopRef] = []
+        audience: Audience = {"experienced": False, "manualLicence": False}
+        for o in (x, y):
+            facts = self.facts_of(self.requests[o["id"]])
+            stops += self.tighten(o, stops_for(o, [0], None, Retry()), facts)
+            audience["experienced"] = audience["experienced"] or o["legs"][0]["car"]["premium"]
+            audience["manualLicence"] = audience["manualLicence"] or facts.manual
+            self.first_posted.setdefault(o["id"], self.now)
+        stops = without_windows(stops, self.now)
+        end = max(self.now, min(self.eff_last_pickup(o) for o in (x, y)) - 3 * HOUR)
+        step = max(REPRICE_EVERY, (end - self.now) // 40 + 1)
+        schedule: list[FeeStep] = []
+        t = self.now
+        while True:
+            fee = max(1, int(COMBO_FACTOR * (self.fee_at(x, 1, t) + self.fee_at(y, 1, t))))
+            if not schedule or fee > schedule[-1]["feeCents"]:
+                schedule.append({"at": t, "feeCents": fee})
+            if t >= end or len(schedule) >= 48:
+                break
+            t = min(end, t + step)
+        self.outbox.append({"type": "post", "stops": stops, "audience": audience, "schedule": schedule})
 
     # ── Gig tracking ──
 
@@ -618,10 +804,14 @@ class SmartDesk:
             return False
         self.leg_gigs.pop(order_id, None)
         self.outbox += [{"type": "withdraw", "gigId": gig_id} for gig_id in gigs]
+        for gig_id in gigs:
+            if self.is_combo(gig_id):
+                self.dead_gigs.add(gig_id)
+                self.repost_others(gig_id, skip=order_id)
         return True
 
     def send_post_of(self, order_id: str) -> None:
-        if any(a["type"] == "post" and a["stops"][0]["orderId"] == order_id for a in self.outbox):
+        if any(a["type"] == "post" and any(s["orderId"] == order_id for s in a["stops"]) for a in self.outbox):
             self.send()
 
     def send(self) -> None:
@@ -630,9 +820,25 @@ class SmartDesk:
             self.read_results(actions, self.world.act(actions))
 
     def read_results(self, actions: list[Action], results: list[ActionResult]) -> None:
+        retry_orders: list[str] = []
         for action, result in zip(actions, results):
             if action["type"] == "post" and result["ok"] is True:
                 self.carry(action, result["id"])
+            elif action["type"] == "withdraw" and result["ok"] is not True:
+                # A driver took it first: the gig still carries its cars.
+                gig = action["gigId"]
+                if gig in self.dead_gigs and gig in self.posts:
+                    self.dead_gigs.discard(gig)
+                    for st in self.posts[gig]["stops"]:
+                        if st["orderId"] in self.orders and self.orders[st["orderId"]]["deliveredAt"][st["leg"]] is None:
+                            self.leg_gigs.setdefault(st["orderId"], {})[st["leg"]] = gig
+            elif action["type"] == "post" and result["ok"] is not True and len({s["orderId"] for s in action["stops"]}) > 1:
+                retry_orders += [s["orderId"] for s in action["stops"] if s["kind"] == "pickup"]
+        # A pair the world refused: post each car that has no live gig on its own.
+        for oid in dict.fromkeys(retry_orders):
+            order = self.orders.get(oid)
+            if order is not None and not self.gigs_of(oid) and undelivered(order):
+                self.post(order, undelivered(order))
 
     # ── Periodic maintenance (called each advance step) ──
 
@@ -662,7 +868,8 @@ class SmartDesk:
             return
         for oid, order in self.orders.items():
             for gig_id in self.gigs_of(oid):
-                if gig_id in self.booked or gig_id in self.dead_gigs or self.open_offers.get(gig_id, 0) >= 2:
+                if gig_id in self.booked or gig_id in self.dead_gigs or self.open_offers.get(gig_id, 0) >= 2 \
+                        or self.is_combo(gig_id):
                     continue
                 action = self.posts.get(gig_id)
                 if action is None:
@@ -736,3 +943,13 @@ class SmartDesk:
                     self.retry(order["id"], event["leg"], event["reason"])
         for request in snapshot["openRequests"]:
             self.quote(request)
+
+
+# Test runs can override the constants above: SPREAD_TUNE='{"LEAD_MIN": {"8": 240}, "STUCK_STOP": 4}'
+for _k, _v in json.loads(os.environ.get("SPREAD_TUNE") or "{}").items():
+    if _k in globals():
+        if isinstance(globals()[_k], dict) and isinstance(_v, dict):
+            globals()[_k].update({int(a): b for a, b in _v.items()})
+        else:
+            globals()[_k] = _v
+

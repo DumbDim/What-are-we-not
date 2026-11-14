@@ -1,15 +1,21 @@
 """Dynamic pricing engine. Decides what to quote per request based on supply, demand, and trust."""
 from __future__ import annotations
+import json
+import os
 from typing import Optional
 from spread.types import PriceRequest, DeliveryOption
 
 HOUR = 60
+DAY1_DISCOUNT, DISCOUNT_UNTIL = 1.0, 1440  # level 8: multiply quotes by this before DISCOUNT_UNTIL (Tuesday 00:00) to build trust early
+WAR_PRICE = 0.82  # level 8: on a detected price-war day, multiply quotes by this (1.0 = sit it out)
+MONDAY_MARKUP = None  # level 8: starting markup on Monday instead of L8_MARKUP (None = same)
+L7_MARKUP, L8_MARKUP = 1.30, 1.40  # starting price over the list price; learned lane prices adjust it
 EXPECTED_FEE = 1.2  # times the typical fee
 MIN_MARGIN = 0.10  # least share above the expected fee
 # Learned prices: each pickup place and delivery place has a factor that rises after a win and falls
 # after a loss. With these steps it settles where we win about 45% of our quotes.
 LANE_UP, LANE_DOWN, LANE_MIN, LANE_MAX = 0.020, 0.016, 0.85, 1.25
-WAR_WINDOW, WAR_DROP = 20, 1 / 3  # price war: our recent win rate everywhere fell under a third of our usual rate
+WAR_WINDOW, WAR_DROP, WAR_FLOOR, WAR_WARMUP = 20, 1 / 3, 0.10, 40  # one price war a week: last 20 quotes win under max(10%, a third of usual), after 40 results  # price war: our recent win rate everywhere fell under a third of our usual rate
 OUTAGE_STREAK, OUTAGE_BONUS = 5, 1.15  # outage: our last quotes from one pickup place all won
 
 
@@ -29,6 +35,8 @@ class Pricer:
         self.by_pickup: dict[str, list[bool]] = {}
         self.war_day = -1  # the day we saw a price war
         self.usual_win = None  # long-run share of our quotes that win
+        self.results_seen = 0
+        self.war_seen = False  # the rules give one price war a week
         self.outage: dict[str, int] = {}  # pickup place -> day of its outage
         self.now = 0
 
@@ -56,7 +64,9 @@ class Pricer:
         base = list_price
 
         if self.level >= 7:
-            markup = 1.30 if self.level == 7 else 1.40
+            markup = L7_MARKUP if self.level == 7 else L8_MARKUP
+            if self.level >= 8 and MONDAY_MARKUP is not None and self.now < 1440:
+                markup = MONDAY_MARKUP
             base = int(list_price * markup)
         elif self.level >= 4:
             base = int(list_price * 1.05)
@@ -86,6 +96,12 @@ class Pricer:
         elif option["kind"] == "within_3_days":
             base = int(base * 1.02)
 
+        if self.level >= 8 and WAR_PRICE != 1.0 and self.war_day == self.now // 1440                 and 8 * 60 <= self.now % 1440 < 18 * 60:
+            base = int(base * WAR_PRICE)  # compete while the competitor's discount runs: 08:00-18:00
+
+        if self.level >= 8 and DAY1_DISCOUNT != 1.0 and self.now < DISCOUNT_UNTIL:
+            base = int(base * DAY1_DISCOUNT)
+
         min_price = int(ref_fee * 1.15)
         return max(base, min_price)
 
@@ -109,14 +125,18 @@ class Pricer:
         if lane is None or self.level < 4:
             return
         pickup, delivery = lane
+        if DAY1_DISCOUNT != 1.0 and now < DISCOUNT_UNTIL:
+            return  # discounted wins say nothing about the normal price
         day = now // 1440
         self.recent = (self.recent + [won])[-WAR_WINDOW:]
         hist = self.by_pickup.setdefault(pickup, [])
         hist.append(won)
         del hist[:-OUTAGE_STREAK]
+        self.results_seen += 1
         rate = self.recent.count(True) / len(self.recent)
-        if self.usual_win is not None and len(self.recent) >= WAR_WINDOW and rate < self.usual_win * WAR_DROP                 and 8 * 60 <= now % 1440 < 18 * 60:
-            self.war_day = day  # the competitor cut its prices for the day: do not chase it down
+        if not self.war_seen and self.usual_win is not None and self.results_seen >= WAR_WARMUP                 and len(self.recent) >= WAR_WINDOW and rate <= max(WAR_FLOOR, self.usual_win * WAR_DROP)                 and 8 * 60 <= now % 1440 < 18 * 60:
+            self.war_day = day  # the competitor cut its prices for the day
+            self.war_seen = True
         if self.war_day != day:
             self.usual_win = float(won) if self.usual_win is None else 0.98 * self.usual_win + 0.02 * won
         if len(hist) >= OUTAGE_STREAK and all(hist):
@@ -144,3 +164,13 @@ class Pricer:
 
     def record_loss(self, request_id: str) -> None:
         pass
+
+
+# Test runs can override the constants above: SPREAD_TUNE='{"LEAD_MIN": {"8": 240}, "STUCK_STOP": 4}'
+for _k, _v in json.loads(os.environ.get("SPREAD_TUNE") or "{}").items():
+    if _k in globals():
+        if isinstance(globals()[_k], dict) and isinstance(_v, dict):
+            globals()[_k].update({int(a): b for a, b in _v.items()})
+        else:
+            globals()[_k] = _v
+
