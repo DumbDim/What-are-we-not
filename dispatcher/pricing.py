@@ -1,0 +1,146 @@
+"""Dynamic pricing engine. Decides what to quote per request based on supply, demand, and trust."""
+from __future__ import annotations
+from typing import Optional
+from spread.types import PriceRequest, DeliveryOption
+
+HOUR = 60
+EXPECTED_FEE = 1.2  # times the typical fee
+MIN_MARGIN = 0.10  # least share above the expected fee
+# Learned prices: each pickup place and delivery place has a factor that rises after a win and falls
+# after a loss. With these steps it settles where we win about 45% of our quotes.
+LANE_UP, LANE_DOWN, LANE_MIN, LANE_MAX = 0.020, 0.016, 0.85, 1.25
+WAR_WINDOW, WAR_DROP = 20, 1 / 3  # price war: our recent win rate everywhere fell under a third of our usual rate
+OUTAGE_STREAK, OUTAGE_BONUS = 5, 1.15  # outage: our last quotes from one pickup place all won
+
+
+class Pricer:
+    """Tracks competitor behavior and dealer trust to set optimal prices."""
+
+    def __init__(self, level: int):
+        self.level = level
+        self.dealer_wins: dict[str, int] = {}
+        self.dealer_total: dict[str, int] = {}
+        self.won_count = 0
+        self.late_count = 0
+        self.f_pickup: dict[str, float] = {}
+        self.f_delivery: dict[str, float] = {}
+        self.quoted: dict[str, tuple[str, str]] = {}  # request id -> (pickup, delivery) of a real quote
+        self.recent: list[bool] = []  # outcomes of our last real quotes, everywhere
+        self.by_pickup: dict[str, list[bool]] = {}
+        self.war_day = -1  # the day we saw a price war
+        self.usual_win = None  # long-run share of our quotes that win
+        self.outage: dict[str, int] = {}  # pickup place -> day of its outage
+        self.now = 0
+
+    def on_time_rate(self) -> float:
+        delivered = self.won_count - self.late_count
+        return delivered / max(1, self.won_count)
+
+    def quote_prices(self, request: PriceRequest, driver_supply: float = 1.0,
+                     active_orders: int = 0, unbooked: int = 0) -> dict[str, int]:
+        prices = {}
+        for option in request["options"]:
+            price = self._price_option(request, option, driver_supply, active_orders, unbooked)
+            if price is not None:
+                prices[option["kind"]] = price
+        return prices
+
+    def _price_option(self, request: PriceRequest, option: DeliveryOption,
+                      driver_supply: float, active_orders: int, unbooked: int) -> Optional[int]:
+        list_price = option["listPriceCents"]
+        ref_fee = request["referenceFeeCents"]
+
+        if self.level <= 3:
+            return list_price
+
+        base = list_price
+
+        if self.level >= 7:
+            markup = 1.30 if self.level == 7 else 1.40
+            base = int(list_price * markup)
+        elif self.level >= 4:
+            base = int(list_price * 1.05)
+
+        dealer_id = request["dealerId"]
+        trust_count = self.dealer_wins.get(dealer_id, 0)
+        if self.level >= 8 and trust_count > 0:
+            # Each on-time order raises what this dealer accepts from us by 1%, up to 25%.
+            trust_bonus = min(trust_count, 25) * 0.01
+            base = int(base * (1 + trust_bonus))
+
+        if self.level >= 7:
+            # Judge the margin on the price we quote against the fee we expect to pay
+            # (drivers mostly book between 1.0 and 1.6 times the typical fee).
+            if base < ref_fee * EXPECTED_FEE * (1 + MIN_MARGIN):
+                return None
+        elif driver_supply < 0.5:
+            if ref_fee > list_price * 0.7:
+                return None
+            base = int(base * 1.10)
+
+        if self.level >= 4:
+            base = int(base * self.lane_factor(request))
+
+        if option["kind"] == "same_day":
+            base = int(base * 0.98)
+        elif option["kind"] == "within_3_days":
+            base = int(base * 1.02)
+
+        min_price = int(ref_fee * 1.15)
+        return max(base, min_price)
+
+    # ── Learned prices ──
+
+    def lane_factor(self, request: PriceRequest) -> float:
+        pickup = request["legs"][0]["pickup"]["placeId"]
+        delivery = request["legs"][0]["delivery"]["placeId"]
+        f = self.f_pickup.get(pickup, 1.0) * self.f_delivery.get(delivery, 1.0)
+        if self.outage.get(pickup) == self.now // 1440:
+            f *= OUTAGE_BONUS
+        return max(LANE_MIN, min(LANE_MAX, f))
+
+    def record_quote(self, request: PriceRequest) -> None:
+        self.quoted[request["id"]] = (request["legs"][0]["pickup"]["placeId"], request["legs"][0]["delivery"]["placeId"])
+
+    def record_result(self, request_id: str, won: bool, now: int) -> None:
+        """Learn from a dealer's answer to one of our real quotes."""
+        self.now = now
+        lane = self.quoted.pop(request_id, None)
+        if lane is None or self.level < 4:
+            return
+        pickup, delivery = lane
+        day = now // 1440
+        self.recent = (self.recent + [won])[-WAR_WINDOW:]
+        hist = self.by_pickup.setdefault(pickup, [])
+        hist.append(won)
+        del hist[:-OUTAGE_STREAK]
+        rate = self.recent.count(True) / len(self.recent)
+        if self.usual_win is not None and len(self.recent) >= WAR_WINDOW and rate < self.usual_win * WAR_DROP                 and 8 * 60 <= now % 1440 < 18 * 60:
+            self.war_day = day  # the competitor cut its prices for the day: do not chase it down
+        if self.war_day != day:
+            self.usual_win = float(won) if self.usual_win is None else 0.98 * self.usual_win + 0.02 * won
+        if len(hist) >= OUTAGE_STREAK and all(hist):
+            self.outage[pickup] = day  # the competitor seems down here today
+        if won:
+            step = 1 + LANE_UP
+        elif self.war_day == day:
+            return
+        else:
+            step = 1 - LANE_DOWN
+        for table, place in ((self.f_pickup, pickup), (self.f_delivery, delivery)):
+            table[place] = max(LANE_MIN, min(LANE_MAX, table.get(place, 1.0) * step))
+
+    def record_win(self, dealer_id: str, price: int, option: str) -> None:
+        self.dealer_total[dealer_id] = self.dealer_total.get(dealer_id, 0) + 1
+        self.won_count += 1
+
+    def record_delivery(self, dealer_id: str, on_time: bool) -> None:
+        if on_time:
+            self.dealer_wins[dealer_id] = self.dealer_wins.get(dealer_id, 0) + 1
+        else:
+            self.late_count += 1
+            current = self.dealer_wins.get(dealer_id, 0)
+            self.dealer_wins[dealer_id] = current // 2
+
+    def record_loss(self, request_id: str) -> None:
+        pass
