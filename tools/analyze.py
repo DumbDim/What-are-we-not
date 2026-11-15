@@ -147,11 +147,21 @@ def play_one(level, seed, verbose, keep, attempts=4):
     client = Client()
     router = Router(client.map())
     for attempt in range(attempts):
-        world = client.create(level=level, seed=seed)
+        for _ in range(12):
+            try:
+                world = client.create(level=level, seed=seed)
+                break
+            except (Unreachable, TimeoutError, ConnectionError, OSError):
+                time.sleep(10)
+        else:
+            raise RuntimeError("could not create a world")
         buf = io.StringIO()
         try:
             desk = run.play_practice(world, level, router)
             print(f"[{seed}] multi-car gigs posted: {desk.combo_count}", flush=True)
+            print(f"[{seed}] viewer offers sent: {desk.viewer_offers}", flush=True)
+            m = desk.pricer.model
+            print(f"[{seed}] model: quotes priced {desk.pricer.model_quotes}, results learned {m.seen}, price slope {m.w['r']:.2f}", flush=True)
             tw = desk.pricer.dealer_wins
             print(f"[{seed}] trust: dealers {len(tw)}, total count {sum(tw.values())}, at 25: {sum(1 for v in tw.values() if v >= 25)}, avg {sum(tw.values()) / max(1, len(tw)):.1f}", flush=True)
             print(f"[{seed}] requests: " + ", ".join(f"{k}={v}" for k, v in desk.reasons.most_common()), flush=True)

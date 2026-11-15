@@ -27,3 +27,4 @@ __pycache__/
 tools/*.txt
 tools/_edit_desk.py
 tools/_edit_combo.py
+tools/_edit_viewers.py

@@ -49,6 +49,22 @@ TIGHT_CAP, TIGHT_STUCK, TIGHT_LEAD = 0.5, 2, 60  # when tight: cap share x0.5, s
 # Multi-car gigs (level 3+): chain two single-car orders when one's delivery ends near the other's pickup.
 COMBO_LEVEL, COMBO_GAP, COMBO_FACTOR, COMBO_MAX_DRIVE = 99, 45, 0.90, 11 * HOUR
 HOT_CAP_PLACES, HOT_CAP_SHARE = ["vantaa", "hyvinkaa"], 0.09  # level 8: a larger per-town share for our busiest pickups (0 = off)
+# Viewer offers (level 3+): drivers who viewed a gig are on the app today; offer it to them directly.
+VIEWER_OFFERS, VIEW_WAIT, VIEW_RECENT, VIEW_OFFER_MULT = False, 10, 3 * HOUR, 1.2
+OLD_OFFERS = True  # offers to drivers picked by home or last finish (about 0.2% were accepted)
+# Booking-speed capacity: an area whose gigs book fast has spare drivers, one whose gigs sit has none.
+SPEED_CAP, SPEED_FAST, SPEED_MIN, SPEED_MAX = False, 30, 0.6, 1.6
+FEE_STEP_AFTER, FEE_STEP = 0, 1.3  # fee step: typical fee for this many minutes, then FEE_STEP (0 = the usual curve)
+# Destination priority (level 8): work harder for our best-margin places, less for the ones that earn little.
+PRIO_DESTS = ["oulu", "jyvaskyla", "rovaniemi", "kokkola", "ylivieska"]
+LOW_PRIO_DESTS = ["kajaani", "kemi", "kotka", "savonlinna"]
+PRIO_CAP_BOOST, PRIO_LEAD_CUT, LOW_CAP_CUT, LOW_LEAD_ADD = 1.0, 0, 1.0, 0  # acceptance priority (1.0 / 0 = off)
+PRIO_FEE, PRIO_HOLD, PRIO_PLATEAU, LOW_PLATEAU = False, 0.0, 1.8, 1.3  # fee priority
+# Same-day work books slowly (drivers have planned their day); next-day work books within the hour.
+SAMEDAY_OPEN = 1.0  # opening fee for same-day orders, times the typical fee (FEE_OPEN for others)
+VIEWER_SAMEDAY_ONLY = False  # viewer offers only for same-day orders
+LATER_CAP_WEIGHT = 1.0  # an unbooked order not ready until a later day counts this much towards the per-town limit
+from .pricing import BULK_ON as BULK_ON_DESK, BULK_MIN as BULK_MIN_DESK, BULK_MARKUP as BULK_MARKUP_DESK  # noqa: E402
 STUCK_STOP = 3  # stop taking orders near a pickup while this many of ours there are past their warning without a driver
 DECLINE = 5  # from level 4, decline with a quote this many times the list price: a lost quote costs nothing
 
@@ -87,6 +103,11 @@ class SmartDesk:
         self.tight = False  # the adaptive guard is on
         self.guard_log: list = []
         self.combo_count = 0
+        self.batch_seen: dict[str, int] = {}
+        self.viewers: dict[str, dict[str, int]] = {}  # gig -> driver -> minute of their last view
+        self.fast: dict[str, float] = {}  # pickup place -> share of our gigs there booked within SPEED_FAST
+        self.viewer_offers = 0
+        self.pricer.load_fn = self.area_load
         self._risk_at = -1
         self.active: dict[str, set[str]] = {}  # driver -> our gigs they hold and have not finished
         self.last_seen: dict[str, tuple[str, int]] = {}  # driver -> (place, minute) of their last delivery for us
@@ -122,12 +143,22 @@ class SmartDesk:
             self.repost(event["gigId"])
         elif kind == "deadline_close":
             self.raise_fees(event["orderId"])
+        elif kind == "gig_viewed":
+            self.viewers.setdefault(event["gigId"], {})[event["driverId"]] = event["at"]
         elif kind == "gig_booked":
             self.booked.add(event["gigId"])
+            self.note_speed(event["gigId"], event["at"] - self.gig_posted_at.get(event["gigId"], event["at"]) <= SPEED_FAST)
             self.gig_driver[event["gigId"]] = event["driverId"]
             self.active.setdefault(event["driverId"], set()).add(event["gigId"])
             self.busy_drivers.add(event["driverId"])
             self.driver_mgr.record_booking(event["driverId"], event["feeCents"])
+            action = self.posts.get(event["gigId"])
+            if action is not None and len({s["orderId"] for s in action["stops"]}) == 1:
+                oid = action["stops"][0]["orderId"]
+                req = self.requests.get(oid)
+                if req is not None:
+                    share = req["referenceFeeCents"] * pickups(action) / len(req["legs"])
+                    self.pricer.record_fee(req["legs"][0]["pickup"]["placeId"], event["feeCents"] / max(1, share))
         elif kind in ("gig_dropped", "no_show"):
             self.booked.discard(event["gigId"])
             self._free(event.get("driverId", ""), event["gigId"])
@@ -194,9 +225,14 @@ class SmartDesk:
             lead_min = max(lead_min, 6 * HOUR)  # long drives with little notice were late ~40% of the time
         if self.guard():
             lead_min += TIGHT_LEAD
+        dest = request["legs"][0]["delivery"]["placeId"]
+        if self.level >= 8 and dest in PRIO_DESTS:
+            lead_min = max(3 * HOUR, lead_min - PRIO_LEAD_CUT)
+        elif self.level >= 8 and dest in LOW_PRIO_DESTS:
+            lead_min += LOW_LEAD_ADD
         if awake_minutes(request["respondBy"], last_pickup) < lead_min:
             return "lead_time"
-        if not self.has_capacity(request["legs"][0]["pickup"]["placeId"]):
+        if not self.has_capacity(request["legs"][0]["pickup"]["placeId"], dest):
             return "capacity"
         if self.level < 7:
             return None
@@ -217,7 +253,7 @@ class SmartDesk:
                 return "few_drivers"
         return None
 
-    def has_capacity(self, place: str) -> bool:
+    def has_capacity(self, place: str, dest: Optional[str] = None) -> bool:
         """Few enough of our orders near this pickup still wait for a driver."""
         nearby = self.near_cache.get(place)
         if nearby is None:
@@ -228,6 +264,11 @@ class SmartDesk:
         share = CAP_SHARE_RICH if drivers >= CAP_RICH else CAP_SHARE
         if self.level >= 8 and place in HOT_CAP_PLACES:
             share = max(share, HOT_CAP_SHARE)
+        share *= self.speed_factor(place)
+        if self.level >= 8 and dest in PRIO_DESTS:
+            share *= PRIO_CAP_BOOST
+        elif self.level >= 8 and dest in LOW_PRIO_DESTS:
+            share *= LOW_CAP_CUT
         if self.guard():
             share *= TIGHT_CAP
         cap = max(1 if drivers < CAP_POOR else CAP_MIN, int(drivers * share))
@@ -237,13 +278,30 @@ class SmartDesk:
                 del self.pending_pickup[oid]
                 continue
             if pickup in nearby and not any(g in self.booked for g in self.gigs_of(oid))                     and self.order_last_pickup(oid) >= self.now:
-                waiting += 1
+                waiting += self.cap_weight(oid)
                 if oid in self.urgent:
                     stuck += 1
         # Drivers there stopped booking (a flu day, a busy day): take nothing more until they catch up.
         if stuck >= (TIGHT_STUCK if self.guard() else STUCK_STOP):
             return False
         return waiting < cap
+
+    def area_load(self, place: str) -> float:
+        """Our orders near this pickup that still wait for a driver, over the area's limit."""
+        nearby = self.near_cache.get(place)
+        if nearby is None:
+            nearby = self.near_cache[place] = {
+                p for p in self.router.place_ids if self.router.drive_minutes(p, place) <= 45}
+        drivers = sum(len(self.driver_mgr.home_places.get(p, [])) for p in nearby)
+        share = CAP_SHARE_RICH if drivers >= CAP_RICH else CAP_SHARE
+        if self.level >= 8 and place in HOT_CAP_PLACES:
+            share = max(share, HOT_CAP_SHARE)
+        share *= self.speed_factor(place)
+        cap = max(1 if drivers < CAP_POOR else CAP_MIN, int(drivers * share))
+        waiting = sum(1 for oid, p in self.pending_pickup.items()
+                      if p in nearby and not any(g in self.booked for g in self.gigs_of(oid))
+                      and self.order_last_pickup(oid) >= self.now)
+        return waiting / cap
 
     def risk(self) -> float:
         """Our lateness so far: orders already late, or past their warning with no driver,
@@ -273,6 +331,14 @@ class SmartDesk:
                 self.tight = False
                 self.guard_log.append((self.now, "off", round(r, 3)))
         return self.tight
+
+    def cap_weight(self, oid: str) -> float:
+        if LATER_CAP_WEIGHT == 1.0:
+            return 1.0
+        req = self.requests.get(oid)
+        if req is None:
+            return 1.0
+        return LATER_CAP_WEIGHT if req["legs"][0]["pickup"]["window"]["from"] // DAY > self.now // DAY else 1.0
 
     def order_last_pickup(self, oid: str) -> int:
         order = self.orders.get(oid)
@@ -310,8 +376,14 @@ class SmartDesk:
             self.decline(request)
             return
 
+        batch = request.get("batchId")
+        if batch:
+            self.batch_seen[batch] = self.batch_seen.get(batch, 0) + 1
+        bulk = BULK_ON_DESK and batch and self.batch_seen.get(batch, 0) >= BULK_MIN_DESK
+        self.pricer.bulk_factor = BULK_MARKUP_DESK if bulk else 1.0
         prices = self.pricer.quote_prices(request, driver_supply=supply,
                                           active_orders=len(self.orders), unbooked=unbooked)
+        self.pricer.bulk_factor = 1.0
         prices = {k: v for k, v in prices.items() if k in feasible_kinds}
         if self.is_remote(request):
             # No work comes back from there: the driver's trip home costs more, and the competitor charges more too.
@@ -324,7 +396,7 @@ class SmartDesk:
 
         self.reasons["quoted"] += 1
         self.outbox.append({"type": "quote", "requestId": request["id"], "prices": prices})
-        self.pricer.record_quote(request)
+        self.pricer.record_quote(request, prices)
         self.note_quote(request, max(o["deadline"] for o in request["options"] if o["kind"] in prices))
 
     def is_remote(self, request: PriceRequest) -> bool:
@@ -495,8 +567,10 @@ class SmartDesk:
                 self.outbox.append({"type": "reprice", "gigId": gig_id, "schedule": schedule})
                 self.posts[gig_id] = {**self.posts[gig_id], "schedule": schedule}
         # Direct offers exist from level 3.
-        if self.level >= 3:
+        if self.level >= 3 and OLD_OFFERS:
             self._try_direct_offers_for_order(order_id)
+        if self.level >= 3 and VIEWER_OFFERS:
+            self.offer_viewers(order_id, urgent=True)
 
     def retry(self, order_id: str, leg: int, reason: str) -> None:
         if order_id in self.orders:
@@ -546,7 +620,7 @@ class SmartDesk:
     def _try_next_offer(self, gig_id: str) -> None:
         """After an offer is declined/expired, try the next best driver."""
         action = self.posts.get(gig_id)
-        if action is None or gig_id in self.booked or self.is_combo(gig_id):
+        if action is None or gig_id in self.booked or self.is_combo(gig_id) or not OLD_OFFERS:
             return
         order_id = action["stops"][0]["orderId"]
         order = self.orders.get(order_id)
@@ -586,11 +660,21 @@ class SmartDesk:
             since = max(0, t - self.urgent_at.get(order["id"], t))
             return max(1, int(base * min(2.5, 1.6 + since / 30 * 0.25) + 0.5))
         start = self.first_posted.get(order["id"], t)
+        hold_share, plateau = FEE_HOLD_SHARE, FEE_PLATEAU
+        if PRIO_FEE and self.level >= 8:
+            dest = order["legs"][0]["delivery"]["placeId"]
+            if dest in PRIO_DESTS:
+                hold_share, plateau = PRIO_HOLD, PRIO_PLATEAU
+            elif dest in LOW_PRIO_DESTS:
+                plateau = LOW_PLATEAU
+        if FEE_STEP_AFTER:
+            return max(1, int(base * (FEE_OPEN if t < start + FEE_STEP_AFTER else FEE_STEP) + 0.5))
         warn = self.eff_last_pickup(order) - 3 * HOUR
         span = awake_minutes(start, warn)
-        hold = span * FEE_HOLD_SHARE
+        hold = span * hold_share
         frac = 1.0 if span <= 0 else min(1.0, max(0.0, awake_minutes(start, t) - hold) / max(1.0, span - hold))
-        return max(1, int(base * (FEE_OPEN + (FEE_PLATEAU - FEE_OPEN) * frac) + 0.5))
+        opening = SAMEDAY_OPEN if order.get("option") == "same_day" else FEE_OPEN
+        return max(1, int(base * (opening + (max(plateau, opening) - opening) * frac) + 0.5))
 
     def schedule_for(self, order: Order, cars: int) -> list[FeeStep]:
         self.first_posted.setdefault(order["id"], self.now)
@@ -668,6 +752,74 @@ class SmartDesk:
         for leg in legs:
             self.leg_gigs.get(order["id"], {}).pop(leg, None)
         self.post(order, legs)
+
+    # ── Viewer offers and booking speed ──
+
+    def note_speed(self, gig_id: str, fast: bool) -> None:
+        action = self.posts.get(gig_id)
+        if action is None:
+            return
+        order = self.orders.get(action["stops"][0]["orderId"])
+        if order is None:
+            return
+        place = order["legs"][action["stops"][0]["leg"]]["pickup"]["placeId"]
+        self.fast[place] = 0.8 * self.fast.get(place, 0.6) + 0.2 * (1.0 if fast else 0.0)
+
+    def speed_factor(self, place: str) -> float:
+        """More room where our gigs book fast, less where they sit."""
+        if not SPEED_CAP:
+            return 1.0
+        f = self.fast.get(place)
+        if f is None:
+            return 1.0
+        return max(SPEED_MIN, min(SPEED_MAX, SPEED_MIN + (SPEED_MAX - SPEED_MIN) * f))
+
+    def offer_viewers(self, order_id: str, urgent: bool = False) -> None:
+        """Offer an order's open gig to drivers who viewed it: they are on the app today."""
+        order = self.orders.get(order_id)
+        if order is None or not (7 * HOUR <= self.now % DAY < 22 * HOUR):
+            return
+        if VIEWER_SAMEDAY_ONLY and order.get("option") != "same_day" and not urgent:
+            return
+        for gig_id in self.gigs_of(order_id):
+            if gig_id in self.booked or gig_id in self.dead_gigs or self.is_combo(gig_id):
+                continue
+            action = self.posts.get(gig_id)
+            if action is None:
+                continue
+            if not urgent and self.now - self.gig_posted_at.get(gig_id, self.now) < VIEW_WAIT:
+                continue
+            slots = 3 - self.open_offers.get(gig_id, 0)
+            if slots <= 0:
+                continue
+            first = next(st for st in action["stops"] if st["kind"] == "pickup")
+            place = order["legs"][first["leg"]]["pickup"]["placeId"]
+            tried = self.offered.setdefault(gig_id, set())
+            cands = []
+            for d, seen_at in self.viewers.get(gig_id, {}).items():
+                if d in tried or d in self.busy_drivers or self.now - seen_at > VIEW_RECENT:
+                    continue
+                if not self.driver_mgr.can_offer(d, self.now):
+                    continue
+                prof = self.driver_mgr.drivers.get(d)
+                if prof is None:
+                    continue
+                if action["audience"]["experienced"] and not self.driver_mgr.is_experienced(d):
+                    continue
+                if action["audience"]["manualLicence"] and prof["licence"] != "manual":
+                    continue
+                cands.append((self.router.drive_minutes(prof["homePlaceId"], place), d))
+            if not cands:
+                continue
+            cands.sort()
+            cars = pickups(action)
+            fee = max(self.fee_at(order, cars, self.now), int(self.fee_base(order, cars) * VIEW_OFFER_MULT))
+            for _, d in cands[: min(2, slots)]:
+                self.outbox.append({"type": "offer", "gigId": gig_id, "driverId": d, "feeCents": fee})
+                self.driver_mgr.record_offer(d, self.now)
+                tried.add(d)
+                self.open_offers[gig_id] = self.open_offers.get(gig_id, 0) + 1
+                self.viewer_offers += 1
 
     # ── Multi-car gigs ──
 
@@ -855,9 +1007,12 @@ class SmartDesk:
                 self.raise_fees(oid)
         if self.level == 1:
             self.reprice_level1()
-        if self.level >= 3:
+        if self.level >= 3 and OLD_OFFERS:
             self.offer_nearby()
             self._offer_stuck_gigs()
+        if self.level >= 3 and VIEWER_OFFERS:
+            for oid in list(self.orders):
+                self.offer_viewers(oid)
 
     def offer_nearby(self) -> None:
         """Offer open gigs to our own drivers who just finished near the pickup: for them the car is
@@ -952,7 +1107,7 @@ class SmartDesk:
 for _k, _v in json.loads(os.environ.get("SPREAD_TUNE") or "{}").items():
     if _k in globals():
         if isinstance(globals()[_k], dict) and isinstance(_v, dict):
-            globals()[_k].update({int(a): b for a, b in _v.items()})
+            globals()[_k].update({(int(a) if str(a).isdigit() else a): b for a, b in _v.items()})
         else:
             globals()[_k] = _v
 
