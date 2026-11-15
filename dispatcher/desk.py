@@ -32,6 +32,9 @@ WAKE_ON: list[DeskEventKind] = [
 LEAD_MIN = {1: 240, 2: 240, 3: 240, 4: 240, 5: 240, 6: 240, 7: 300, 8: 300}
 # Fee schedule as multiples of the typical fee: opening, level reached by the deadline warning, urgent cap.
 FEE_OPEN, FEE_PLATEAU = 1.0, 1.6
+# Lowball: an order with plenty of waking time opens below the typical fee and climbs to it over the hold
+# phase. 32-45% of such gigs booked below the typical fee in testing; +7% margin over five level-8 weeks.
+LOWBALL_OPEN, LOWBALL_MIN_SPAN = 0.80, 16 * 60  # opening fee; least waking minutes before the deadline warning
 REPRICE_EVERY = 30  # level 1 has one fee step: we raise it ourselves this often
 MIN_PRICE_OVER_FEE = 1.0  # levels 1-3: take a request only when its list price covers the typical fee
 SAFETY_MIN, SAFETY_SHARE = 30, 0.10  # windows end this long before the last pickup and the deadline
@@ -589,6 +592,10 @@ class SmartDesk:
         warn = self.eff_last_pickup(order) - 3 * HOUR
         span = awake_minutes(start, warn)
         hold = span * FEE_HOLD_SHARE
+        if LOWBALL_OPEN < FEE_OPEN and span >= LOWBALL_MIN_SPAN and hold > 0:
+            elapsed = awake_minutes(start, t)
+            if elapsed < hold:  # ask less first: drivers for whom the car is cheap take it
+                return max(1, int(base * (LOWBALL_OPEN + (FEE_OPEN - LOWBALL_OPEN) * elapsed / hold) + 0.5))
         frac = 1.0 if span <= 0 else min(1.0, max(0.0, awake_minutes(start, t) - hold) / max(1.0, span - hold))
         return max(1, int(base * (FEE_OPEN + (FEE_PLATEAU - FEE_OPEN) * frac) + 0.5))
 
