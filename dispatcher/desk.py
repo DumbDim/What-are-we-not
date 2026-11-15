@@ -33,8 +33,9 @@ LEAD_MIN = {1: 240, 2: 240, 3: 240, 4: 240, 5: 240, 6: 240, 7: 300, 8: 300}
 # Fee schedule as multiples of the typical fee: opening, level reached by the deadline warning, urgent cap.
 FEE_OPEN, FEE_PLATEAU = 1.0, 1.6
 # Lowball: an order with plenty of waking time opens below the typical fee and climbs to it over the hold
-# phase. 32-45% of such gigs booked below the typical fee in testing; +7% margin over five level-8 weeks.
-LOWBALL_OPEN, LOWBALL_MIN_SPAN = 0.80, 16 * 60  # opening fee; least waking minutes before the deadline warning
+# phase. 28-45% of such gigs booked below the typical fee in testing. 24 hours (not 16) keeps tight orders at the
+# full fee: level on normal weeks, +20% margin on hard weeks against no lowball.
+LOWBALL_OPEN, LOWBALL_MIN_SPAN = 0.80, 24 * 60  # opening fee; least waking minutes before the deadline warning
 REPRICE_EVERY = 30  # level 1 has one fee step: we raise it ourselves this often
 MIN_PRICE_OVER_FEE = 1.0  # levels 1-3: take a request only when its list price covers the typical fee
 SAFETY_MIN, SAFETY_SHARE = 30, 0.10  # windows end this long before the last pickup and the deadline
